@@ -290,6 +290,7 @@ typedef struct vkmesh_vk {
     size_t workspace_peak_bytes;
     uint32_t workspace_memory_type;
     int workspace_memory_type_reported;
+    int has_memory_budget;
 } vkmesh_vk;
 
 typedef struct vkmesh_device_mesh {
@@ -736,20 +737,75 @@ static int write_meshbin(const char * path, const vkmesh_mesh * mesh) {
 }
 
 static uint32_t find_memory_type(
-    VkPhysicalDevice physical,
+    vkmesh_vk * vk,
     uint32_t type_bits,
     VkMemoryPropertyFlags required_flags,
-    VkMemoryPropertyFlags preferred_flags) {
-    VkPhysicalDeviceMemoryProperties props;
-    vkGetPhysicalDeviceMemoryProperties(physical, &props);
-    uint32_t fallback = UINT32_MAX;
-    for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
-        if ((type_bits & (1u << i)) == 0 ||
-            (props.memoryTypes[i].propertyFlags & required_flags) != required_flags) continue;
-        if (fallback == UINT32_MAX) fallback = i;
-        if ((props.memoryTypes[i].propertyFlags & preferred_flags) == preferred_flags) return i;
+    VkMemoryPropertyFlags preferred_flags,
+    VkDeviceSize bytes) {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_props;
+    memset(&budget_props, 0, sizeof(budget_props));
+    budget_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 props2;
+    memset(&props2, 0, sizeof(props2));
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    if (vk != NULL && vk->has_memory_budget) {
+        props2.pNext = &budget_props;
     }
-    return fallback;
+    vkGetPhysicalDeviceMemoryProperties2(vk->physical_device, &props2);
+    const VkPhysicalDeviceMemoryProperties * props = &props2.memoryProperties;
+
+    uint32_t preferred_fit = UINT32_MAX;
+    uint32_t required_fit = UINT32_MAX;
+    uint32_t preferred_any = UINT32_MAX;
+    uint32_t required_any = UINT32_MAX;
+    VkDeviceSize preferred_avail = 0;
+    VkDeviceSize required_avail = 0;
+    for (uint32_t i = 0; i < props->memoryTypeCount; ++i) {
+        if ((type_bits & (1u << i)) == 0) continue;
+        if ((props->memoryTypes[i].propertyFlags & required_flags) != required_flags) continue;
+        const uint32_t heap = props->memoryTypes[i].heapIndex;
+        VkDeviceSize available = props->memoryHeaps[heap].size;
+        if (vk != NULL && vk->has_memory_budget && budget_props.heapBudget[heap] > 0) {
+            const VkDeviceSize budget = budget_props.heapBudget[heap];
+            const VkDeviceSize usage = budget_props.heapUsage[heap];
+            available = budget > usage ? budget - usage : 0;
+        } else if (vk != NULL && vk->workspace_memory_type_reported &&
+                   props->memoryTypes[vk->workspace_memory_type].heapIndex == heap &&
+                   available > vk->workspace_current_bytes) {
+            available -= vk->workspace_current_bytes;
+        }
+        const int is_preferred =
+            (props->memoryTypes[i].propertyFlags & preferred_flags) == preferred_flags;
+        if (is_preferred && preferred_any == UINT32_MAX) preferred_any = i;
+        if (required_any == UINT32_MAX) required_any = i;
+        if (bytes > available) continue;
+        if (is_preferred && preferred_fit == UINT32_MAX) {
+            preferred_fit = i;
+            preferred_avail = available;
+        }
+        if (required_fit == UINT32_MAX) {
+            required_fit = i;
+            required_avail = available;
+        }
+    }
+    if (preferred_fit != UINT32_MAX) return preferred_fit;
+    if (required_fit != UINT32_MAX) {
+        if (preferred_any != UINT32_MAX && preferred_any != required_fit) {
+            const uint32_t old_heap = props->memoryTypes[preferred_any].heapIndex;
+            const uint32_t new_heap = props->memoryTypes[required_fit].heapIndex;
+            fprintf(stderr,
+                "vkmesh: allocation %.1f MiB does not fit preferred heap %u; "
+                "using host-visible type=%u heap=%u (available %.1f MiB)\n",
+                (double) bytes / (1024.0 * 1024.0),
+                old_heap,
+                required_fit,
+                new_heap,
+                (double) required_avail / (1024.0 * 1024.0));
+        }
+        return required_fit;
+    }
+    (void) preferred_avail;
+    return preferred_any != UINT32_MAX ? preferred_any : required_any;
 }
 
 static int vkmesh_device_supports_memory_budget(VkPhysicalDevice physical) {
@@ -883,10 +939,11 @@ static int vk_buffer_create_internal(
         return 0;
     }
     uint32_t memory_type = find_memory_type(
-        vk->physical_device,
+        vk,
         req.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        preferred_memory_flags);
+        preferred_memory_flags,
+        req.size);
     if (memory_type == UINT32_MAX) {
         vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
         fprintf(stderr, "vkmesh: selected device has no host-visible coherent storage-buffer memory type\n");
@@ -901,9 +958,10 @@ static int vk_buffer_create_internal(
         vk->workspace_memory_type = memory_type;
         vk->workspace_memory_type_reported = 1;
         fprintf(stderr,
-            "vkmesh: workspace memory type=%u heap=%u device_local=%d host_visible=%d coherent=%d\n",
+            "vkmesh: workspace memory type=%u heap=%u size=%.1f MiB device_local=%d host_visible=%d coherent=%d\n",
             memory_type,
             type->heapIndex,
+            (double) memory_props.memoryHeaps[type->heapIndex].size / (1024.0 * 1024.0),
             (type->propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0,
             (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0,
             (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0);
@@ -1153,6 +1211,7 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     } else if (profile_requested) {
         fprintf(stderr, "vkmesh: GPU profiling unavailable on the selected compute queue\n");
     }
+    vk->has_memory_budget = vkmesh_device_supports_memory_budget(vk->physical_device);
     vk->workspace_budget_bytes = vkmesh_resolve_workspace_budget(vk->physical_device);
     fprintf(stderr,
         "vkmesh: using Vulkan device %d: %s (GPU workspace budget %.1f MiB)\n",

@@ -39,6 +39,7 @@ endif()
 
 option(TRELLIS2_C_BUILD_TESTS "Build trellis2.c tests" ON)
 option(TRELLIS2_C_BUILD_TOOLS "Build trellis2.c command line tools" ON)
+option(TRELLIS2_C_BUILD_VKMESH "Build the vkmesh remesh/postprocess tool" OFF)
 option(TRELLIS2_C_BUILD_RAYLIB_VIEWER "Build the raylib GUI" ON)
 option(TRELLIS2_C_ENABLE_TENSOR_CORES "Prefer tensor-core capable kernels when 16-bit data and hardware support are available" ON)
 option(TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE "Build Vulkan glTF texture baking independent of the inference backend" ON)
@@ -75,7 +76,7 @@ if (TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE)
 endif()
 message(STATUS "TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE=${TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE}")
 
-if (GGML_VULKAN OR TRELLIS2_C_HAS_GLTF_VULKAN_BAKE OR TRELLIS2_C_BUILD_TOOLS)
+if (GGML_VULKAN OR TRELLIS2_C_HAS_GLTF_VULKAN_BAKE OR TRELLIS2_C_BUILD_TOOLS OR TRELLIS2_C_BUILD_VKMESH)
     find_package(Vulkan REQUIRED)
     if (NOT Vulkan_GLSLC_EXECUTABLE)
         find_program(Vulkan_GLSLC_EXECUTABLE glslc REQUIRED)
@@ -1048,11 +1049,11 @@ if (TRELLIS2_C_BUILD_TOOLS)
     if (UNIX)
         target_link_libraries(trellis-verify PRIVATE m)
     endif()
+endif()
 
-    # vkmesh is a standalone Vulkan utility even when the inference backend is
-    # CUDA.  Building it beside the model-specific image-to-glTF CLIs lets the
-    # CUDA pipeline's sibling-executable discovery work without --vkmesh.
-    if (Vulkan_FOUND)
+# vkmesh is a standalone Vulkan utility even when the inference backend is
+# CUDA. Build it without the rest of the CLI tools so remesh can run in-process.
+if ((TRELLIS2_C_BUILD_TOOLS OR TRELLIS2_C_BUILD_VKMESH) AND Vulkan_FOUND)
         function(add_vkmesh_shader NAME SOURCE SYMBOL)
             set(SPV "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.spv")
             set(HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/${SYMBOL}.h")
@@ -1210,8 +1211,9 @@ if (TRELLIS2_C_BUILD_TOOLS)
             add_test(NAME trellis2_c_vkmesh_cli_smoke
                 COMMAND $<TARGET_FILE:vkmesh> --help)
         endif()
-    endif()
+endif()
 
+if (TRELLIS2_C_BUILD_TOOLS)
     if (TARGET raylib)
         if (WIN32)
             set_source_files_properties(tools/trellis_viewer.c PROPERTIES COMPILE_DEFINITIONS "NOGDI;NOUSER")

@@ -1,6 +1,7 @@
 [submodule "3rd/ggml"]
 	path = 3rd/ggml
-	url = https://github.com/Wimacs/ggml.git
+	url = git@forgejo:goddard/pie4k-ggml.git
+	branch = pie4k
 [submodule "3rd/raylib"]
 	path = 3rd/raylib
 	url = https://github.com/raysan5/raylib.git
